@@ -1,0 +1,6 @@
+*.pyc
+__pycache__/
+*.wav
+*.log
+data/
+testmic.wav

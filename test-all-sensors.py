@@ -7,8 +7,143 @@ import busio
 from datetime import datetime
 import shutil
 import sys
+import numpy as np
+import geopandas as gpd
+from shapely.geometry import Point, box
 
-# TRY ALL LIBRARIES, FALL BACK GRACEFULLY
+def load_labels_mapping(labels_file_path):
+    sci_to_eng = {}
+    with open(labels_file_path, "r") as lf:
+        for line in lf:
+            if "_" in line:
+                sci, eng = line.strip().split("_", 1)
+                sci_to_eng[sci.strip().lower()] = eng.strip()
+    return sci_to_eng
+
+def get_overlapping_tiles(gps_lat, gps_lon, tile_folder, buffer_km=50):
+    DEG = 30
+    buffer_deg_lat = buffer_km / 110.574
+    buffer_deg_lon = buffer_km / (111.320 * abs(np.cos(np.radians(gps_lat))) + 0.0001) # avoid zero at poles
+    min_lat = gps_lat - buffer_deg_lat
+    max_lat = gps_lat + buffer_deg_lat
+    min_lon = gps_lon - buffer_deg_lon
+    max_lon = gps_lon + buffer_deg_lon
+    lat_bins = list(range(-90, 90, DEG))
+    lon_bins = list(range(-180, 180, DEG))
+    tile_lat = set()
+    tile_lon = set()
+    for lat in lat_bins:
+        if lat <= max_lat and (lat + DEG) >= min_lat:
+            tile_lat.add(lat)
+    for lon in lon_bins:
+        if lon <= max_lon and (lon + DEG) >= min_lon:
+            tile_lon.add(lon)
+    tiles = []
+    for lat in tile_lat:
+        for lon in tile_lon:
+            fname = f'birds_tile_{lat}_{lon}.gpkg'
+            fpath = os.path.join(tile_folder, fname)
+            if os.path.exists(fpath):
+                tiles.append(fpath)
+    return tiles
+
+def fast_species_list_multi_files(gpkg_files, gps_lat, gps_lon, buffer_km=50):
+    found_species = set()
+    point = Point(gps_lon, gps_lat)
+    for file in gpkg_files:
+        gdf = gpd.read_file(file)
+        if len(gdf) == 0:
+            continue
+        gdf = gdf.to_crs(epsg=3395)
+        pt_metric = gpd.GeoSeries([point], crs=4326).to_crs(epsg=3395).iloc[0]
+        zone = pt_metric.buffer(buffer_km * 1000)
+        bbox = zone.bounds
+        if not hasattr(gdf, "sindex"):
+            gdf.sindex
+        poss = list(gdf.sindex.intersection(bbox))
+        gdfcut = gdf.iloc[poss]
+        found = gdfcut[gdfcut.geometry.intersects(zone)]
+        for s in found["sci_name"].unique():
+            found_species.add(str(s).strip().lower())
+    return list(found_species)
+
+def update_bird_list_from_gps(
+    tile_folder, labels_file_path, model_py_path, gps_lat, gps_lon, buffer_km=50
+):
+    print(f"[BirdList] Looking for relevant 30x30 GPKGs near: {gps_lat}, {gps_lon} (buffer {buffer_km}km)")
+    sci_to_eng = load_labels_mapping(labels_file_path)
+    gpkg_files = get_overlapping_tiles(gps_lat, gps_lon, tile_folder, buffer_km)
+    if not gpkg_files:
+        print("[BirdList] No GPKG tiles found. Falling back to all birds.")
+        found_english = sorted(set(sci_to_eng.values()))
+    else:
+        sci_names_found = fast_species_list_multi_files(gpkg_files, gps_lat, gps_lon, buffer_km)
+        found_english = [sci_to_eng[sci] for sci in sci_names_found if sci in sci_to_eng]
+        found_english = sorted(set(found_english))
+        if not found_english:
+            print("[BirdList] No birds found in buffer region; using all birds in labels.txt.")
+            found_english = sorted(set(sci_to_eng.values()))
+    with open(model_py_path, encoding='utf8') as f:
+        lines = f.readlines()
+    new_lines = []
+    inside_bird_list = False
+    for line in lines:
+        if line.strip().startswith('pantanal_birds'):
+            inside_bird_list = True
+            new_lines.append('pantanal_birds = {\n')
+            for b in found_english:
+                new_lines.append(f'    "{b}",\n')
+            new_lines.append('}\n')
+        elif inside_bird_list:
+            if line.strip() == "}":
+                inside_bird_list = False
+        else:
+            new_lines.append(line)
+    with open(model_py_path, 'w', encoding='utf8') as f:
+        f.writelines(new_lines)
+    print(f"[BirdList] pantanal_birds set updated in {model_py_path} with {len(found_english)} species.")
+
+def update_bird_list_all(labels_file_path, model_py_path):
+    sci_to_eng = load_labels_mapping(labels_file_path)
+    english_names = sorted(set(sci_to_eng.values()))
+    with open(model_py_path, encoding='utf8') as f:
+        lines = f.readlines()
+    new_lines = []
+    inside_bird_list = False
+    for line in lines:
+        if line.strip().startswith('pantanal_birds'):
+            inside_bird_list = True
+            new_lines.append('pantanal_birds = {\n')
+            for b in english_names:
+                new_lines.append(f'    "{b}",\n')
+            new_lines.append('}\n')
+        elif inside_bird_list:
+            if line.strip() == "}":
+                inside_bird_list = False
+        else:
+            new_lines.append(line)
+    with open(model_py_path, 'w', encoding='utf8') as f:
+        f.writelines(new_lines)
+    print(f"[BirdList] No GPS, so all birds in model.py.")
+
+def ensure_gpsd(required=True):
+    gps_dev_candidates = ['/dev/ttyACM0', '/dev/ttyUSB0', '/dev/serial0']
+    try:
+        subprocess.run(['sudo', 'killall', 'gpsd'], check=False)
+        time.sleep(1)
+        for dev in gps_dev_candidates:
+            if os.path.exists(dev):
+                subprocess.Popen(['sudo', 'gpsd', dev, '-F', '/var/run/gpsd.sock'])
+                print(f"[GPSD] Started gpsd on {dev}")
+                time.sleep(2)
+                return dev
+        if required:
+            print("[GPSD] No GPS device found! Will continue, but gps tests will fail.")
+    except Exception as e:
+        print(f"[GPSD] Error setting up gpsd: {e}")
+    return None
+
+# TRY/EXCEPT sensor imports
 try:
     import adafruit_bme680
 except Exception:
@@ -44,8 +179,7 @@ def find_usb_mount():
 
 def test_camera(imagefile="test_cam.jpg"):
     try:
-        rc = subprocess.run(['libcamera-still', '-o', imagefile, '-t', '1000', '--nopreview'],
-                            capture_output=True)
+        rc = subprocess.run(['libcamera-still', '-o', imagefile, '-t', '1000', '--nopreview'], capture_output=True)
         if os.path.exists(imagefile):
             return "Camera: test OK, image saved", imagefile
         else:
@@ -54,7 +188,7 @@ def test_camera(imagefile="test_cam.jpg"):
                 return "Camera: USB webcam test OK, image saved", imagefile
             return f"Camera: test failed, {rc.stderr.decode()}", None
     except Exception as e:
-        return f"Camera: test failed, {e}", None
+        return f"Camera: test failed: {e}", None
 
 def test_bme680():
     if adafruit_bme680 is None:
@@ -93,7 +227,7 @@ def test_pms7003():
     if PMS7003 is None:
         return "PMS7003: test failed: pms7003 lib missing"
     try:
-        pms = PMS7003(device='/dev/ttyS0')  # Adjust if needed
+        pms = PMS7003(device='/dev/ttyS0')
         data = pms.read()
         return 'PMS7003: ' + ', '.join([f'{k}={v}' for k, v in data.items()])
     except Exception as e:
@@ -227,23 +361,16 @@ def get_internet_time():
 def main():
     outputs = []
     usb_mount = find_usb_mount()
-
-    # Test camera
+    dev = ensure_gpsd()
     cam_result, cam_img = test_camera()
     outputs.append(cam_result)
     if cam_img:
         shutil.copy(cam_img, usb_mount)
-
-    # RTC and possible clock update
     rtc_output, rtc_obj = test_rtc()
     outputs.append(rtc_output)
-
     gps_line, gps_time = test_gps()
-    outputs.append(gps_line)   # << ONLY APPENDED ONCE, now
-
+    outputs.append(gps_line)
     ntp_time = get_internet_time()
-
-    # Only update RTC clock with a valid fix/time
     if gps_time and rtc_obj:
         try:
             newdt = datetime.strptime(gps_time.split('.')[0], "%Y-%m-%dT%H:%M:%S")
@@ -254,8 +381,6 @@ def main():
     elif isinstance(ntp_time, datetime) and rtc_obj:
         rtc_set = update_rtc(rtc_obj, ntp_time.timetuple())
         outputs.append(f"RTC set from NTP: {rtc_set}")
-
-    # Test all sensors
     outputs.append(test_bme680())
     outputs.append(test_scd40())
     outputs.append(test_pms7003())
@@ -268,8 +393,6 @@ def main():
     outputs.append(test_motion())
     outputs.append(test_mic())
     outputs.append(test_pico())
-
-    # Save results
     outfile = os.path.join(usb_mount, "test_all_sensors_result.txt")
     with open(outfile, "w") as f:
         dt_string = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -278,13 +401,45 @@ def main():
             print(out)
             f.write(out + "\n")
     print(f"\nLog written to {outfile}")
-
-    # RUN main.py after test/report is done
-    print("Running main.py ...")
+    gps_lat, gps_lon = None, None
+    if gps_line and 'lat=' in gps_line and 'lon=' in gps_line:
+        try:
+            parts = gps_line.split(',')
+            lat = [p for p in parts if 'lat=' in p][0].split('=')[1]
+            lon = [p for p in parts if 'lon=' in p][0].split('=')[1]
+            gps_lat, gps_lon = float(lat), float(lon)
+        except Exception as e:
+            print(f"[GPS] Could not parse GPS lat/lon: {e}")
+    if gps_lat and gps_lon:
+        gps_startup_loc = f"{gps_lat},{gps_lon}"
+        with open("/tmp/gps_startup_loc.txt", "w") as f:
+            f.write(gps_startup_loc)
+        print(f"[init] Startup GPS location: {gps_startup_loc}")
+    else:
+        gps_startup_loc = None
+        print("[init] No valid GPS startup location, will fall back to all birds.")
     try:
-        subprocess.run([sys.executable, "main.py"])
+        tile_folder = os.path.join(usb_mount)
+        labels_path = os.path.join(os.path.dirname(__file__), "labels.txt")
+        model_py_path = os.path.join(os.path.dirname(__file__), "model.py")
+        if os.path.exists(tile_folder) and os.path.exists(labels_path) and os.path.exists(model_py_path):
+            if gps_lat and gps_lon:
+                update_bird_list_from_gps(
+                    tile_folder=tile_folder,
+                    labels_file_path=labels_path,
+                    model_py_path=model_py_path,
+                    gps_lat=gps_lat,
+                    gps_lon=gps_lon,
+                    buffer_km=50
+                )
+            else:
+                update_bird_list_all(labels_file_path=labels_path, model_py_path=model_py_path)
+        else:
+            print("[ERROR] Missing tile directory, model.py, or labels.txt for bird range update.")
     except Exception as e:
-        print(f"Failed to run main.py: {e}")
+        print(f"[BirdList] ERROR: {e}")
+    print("Starting main.py ...")
+    os.execv(sys.executable, ['python3', '/home/juara/juara-field-sensors/main.py'])
 
 if __name__ == "__main__":
     main()

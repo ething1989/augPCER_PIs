@@ -2,82 +2,75 @@ import numpy as np
 import os
 import subprocess
 import time
-import concurrent.futures
 import pandas as pd
-from collections import defaultdict
+from collections import defaultdict, OrderedDict
 from model import Model
 from sound import Stream
 from sensors import SingleReadSensors
 import bioacoustics
 from datetime import datetime
 
-# ------------ Hardware Configs (Edit for your setup) ----------------
-AUDIO_DEVICE_INDEX = 1             # set to USB mic index for Stream
-SENSOR_DEVICE = "bme680"           # Just for your logic–ignored if sensors code auto-detects
+# SET THIS TO YOUR SITE OR INIT FROM test-all-sensors.py
+gps_startup_loc = "42.2949,-83.7101"
+
+AUDIO_DEVICE_INDEX = 1
 DATA_FOLDER = "data"
 MOUNT_POINT = "/mnt/usb"
 USB_DEVICE = "/dev/sda1"
-CYCLE_MINUTES = 9.5                # Data collection per period
-SAVE_AFTER_CYCLES = 12             # #periods before saving batch to USB
-# ---------------------------------------------------------------------
+CYCLE_MINUTES = 10
+CYCLES_PER_WRITE = 1
+CYCLES_PER_SHUTDOWN = 6
+FILENAME_FMT = "%Y-%m-%d.csv"
+
+def calculate_iaq(gas, humidity, temperature):
+    try:
+        if gas is None or gas <= 0 or humidity is None or temperature is None:
+            return None
+        optimal_hum = 40.0
+        humidity_weight = 0.25
+        humidity_score = max(0, min(100, 100 * abs(humidity - optimal_hum) / (100 - optimal_hum)))
+        gas_reference = 250000.0
+        gas_weight = 0.75
+        gas_score = max(0, min(100, 100 * min(gas, gas_reference) / gas_reference))
+        temperature_weight = 0.15
+        temp_score = max(0, min(100, 100 * abs(temperature - 22) / 40))
+        iaq = (humidity_weight * humidity_score) + (gas_weight * (100 - gas_score)) + (temperature_weight * (100 - temp_score))
+        iaq_index = round((1 - iaq / 100) * 500, 2)
+        iaq_index = max(0, min(500, iaq_index))
+        return iaq_index
+    except Exception:
+        return None
 
 def ensure_usb_mounted(mount_point=MOUNT_POINT, device=USB_DEVICE):
     if not os.path.ismount(mount_point):
         os.makedirs(mount_point, exist_ok=True)
         subprocess.run(["sudo", "mount", device, mount_point, "-o", "uid=1000,gid=1000"], check=True)
 
-def safe_usb_copy(local_filename, usb_filename):
+def safe_local_append(df, filename, header):
     try:
-        ensure_usb_mounted()
-        local_file_path = f"{DATA_FOLDER}/{local_filename}"
-        usb_file_path = f"{MOUNT_POINT}/{usb_filename}"
-        subprocess.run(["cp", local_file_path, usb_file_path], check=True)
-        print(f"Data copied to USB as {usb_file_path}.")
-    except Exception as e:
-        print(f"USB copy error: {e}. Will retry next cycle.")
-
-def safe_local_write(df, filename, header):
-    """Append to CSV in data folder, create if first write."""
-    try:
+        os.makedirs(DATA_FOLDER, exist_ok=True)
         local_file_path = f"{DATA_FOLDER}/{filename}"
         file_exists = os.path.exists(local_file_path)
-        df.to_csv(local_file_path, mode='a', header=header or not file_exists, index=False)
-        if not file_exists:
-            print(f"Data saved locally as {local_file_path}.")
-        else:
-            print(f"Data appended locally as {local_file_path}.")
+        df.to_csv(local_file_path, mode='a', header=header and not file_exists, index=False)
+        print(f"Appended locally to {local_file_path}")
     except Exception as e:
         timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
         fallback_filename = f"{DATA_FOLDER}/{filename.split('.')[0]}_{timestamp}.csv"
         df.to_csv(fallback_filename, index=False)
         print(f"Write error for {filename}: {e}. Data saved to {fallback_filename} instead.")
 
-def print_status_bar(start_time, total_time, cycle=None, save_cycle=None):
-    elapsed_time = time.time() - start_time
-    remaining_time = total_time - elapsed_time
-    remaining_time = max(remaining_time, 0)
-    progress_percentage = (elapsed_time / total_time) * 100
-    minutes_progressed = int(elapsed_time // 60)
-
-    status_message = f"[{elapsed_time:.0f}s/{total_time}s] Progress: {progress_percentage:.1f}%, "
-    status_message += f"Remaining: {remaining_time:.0f}s, Minutes: {minutes_progressed}"
-
-    if cycle is not None and save_cycle is not None:
-        status_message += f" | Current Cycle: {cycle}/{save_cycle}"
-        if cycle == save_cycle:
-            status_message += " [Saving to USB next cycle]"
-
-    print(status_message, end="\r", flush=True)
-
-def process_audio_chunk(model, audio_data, bird_counts, known_birds, errors):
+def safe_usb_append(df, filename, header):
     try:
-        audio_data = np.asarray(audio_data).copy()
-        labels = model.predict_threshold([audio_data], min_p=0.15)
-        for label, prob in labels:
-            bird_counts[label] += 1
-            known_birds.add(label)
+        ensure_usb_mounted()
+        usb_file_path = f"{MOUNT_POINT}/{filename}"
+        file_exists = os.path.exists(usb_file_path)
+        df.to_csv(usb_file_path, mode='a', header=header and not file_exists, index=False)
+        print(f"Appended {len(df)} row(s) to USB: {usb_file_path}")
     except Exception as e:
-        errors.append(f"Audio processing error: {e}")
+        print(f"USB append error: {e}. Will retry next cycle.")
+
+def print_status_bar(minute_idx, cycle_idx, total_minutes, total_cycles):
+    print(f"[{datetime.now()}] Cycle {cycle_idx+1}/{total_cycles}, Minute {minute_idx+1}/{total_minutes}", end='\r', flush=True)
 
 def process_sensor_data(sensors, sensor_sums, sensor_counts, errors, motion_trips):
     try:
@@ -86,7 +79,7 @@ def process_sensor_data(sensors, sensor_sums, sensor_counts, errors, motion_trip
             if value is not None:
                 if key == "motion_tripped":
                     if value:
-                        motion_trips[0] += 1   # motion_trips is [int]
+                        motion_trips[0] += 1
                 elif key in {"temp", "humidity", "pressure", "gas", "light"}:
                     sensor_sums[key] += value
                     sensor_counts[key] += 1
@@ -111,111 +104,117 @@ def main():
     stream.start()
     try:
         known_birds = set()
-        errors = []
-        start_time = time.time()
-        cycle_count = 0
-        filename = time.strftime("%Y-%m-%d") + ".csv"  # Overwrite per-day
-        header = [
-            "timestamp", "Temperature (C)", "Temperature (F)",
+        filename = datetime.now().strftime(FILENAME_FMT)
+        static_header = [
+            "timestamp", "gps",
+            "Temperature (C)", "Temperature (F)",
             "Pressure (hPa)", "Pressure (inHg)", "Humidity (%)",
-            "Gas", "Light", "Motion Trips",
+            "Gas", "IAQ", "Light", "Motion Trips",
             "ADI", "ACI", "AEI", "BI", "NDSI",
-            "Total Species", "Total Detections"
-        ]  # Add bird labels dynamically!
-
+            "Total Species", "Total Detections", "Temp Running Avg (C)"
+        ]
+        cycles_since_write = 0
         batch_rows = []
-        last_save = time.time()
+        model_window_size = 144000  # CHANGE as needed for your model
 
-        while True:
-            # ============ Start data accumulation for one period =============
-            period_audio_chunks = []
-            bird_counts  = defaultdict(int)
-            sensor_sums  = defaultdict(float)
-            sensor_counts = defaultdict(int)
-            errors = []
+        for cycle_idx in range(CYCLES_PER_SHUTDOWN):
+            print(f"\n=== Begin Cycle {cycle_idx+1}/{CYCLES_PER_SHUTDOWN} at {datetime.now()} ===")
+            # Running tallies
+            species_counts = defaultdict(int)
             motion_trips = [0]
-            one_period_start = time.time()
-
-            print(f"\n== Period {cycle_count+1} starting: {datetime.now()} ==")
-            while time.time() - one_period_start < CYCLE_MINUTES * 60:
-                # Print minute status
-                elapsed_mins = int((time.time() - one_period_start) // 60)
-                if int(time.time() - one_period_start) % 60 == 0:
-                    print_status_bar(one_period_start, CYCLE_MINUTES*60, cycle_count+1, SAVE_AFTER_CYCLES)
-                # Audio & Model
-                audio_data = stream.get_audio()
-                if audio_data is not None and np.any(audio_data):
-                    process_audio_chunk(model, audio_data, bird_counts, known_birds, errors)
-                    period_audio_chunks.append(audio_data)
-                # Sensor reads
-                process_sensor_data(sensors, sensor_sums, sensor_counts, errors, motion_trips)
+            errors = []
+            temperatures = []
+            accum_sensor_sums = defaultdict(float)
+            accum_sensor_counts = defaultdict(int)
+            bio_chunks = []
+            running_audio_buffer = np.array([], dtype='float32')
+            minute_seconds = int(CYCLE_MINUTES * 60)
+            cycle_start = time.time()
+            while time.time() - cycle_start < minute_seconds:
+                audio_chunk = stream.get_audio()
+                if audio_chunk is not None and np.any(audio_chunk):
+                    running_audio_buffer = np.concatenate([running_audio_buffer, audio_chunk])
+                    bio_chunks.append(audio_chunk)
+                    # Process all full windows in buffer (non-overlapping)
+                    while len(running_audio_buffer) >= model_window_size:
+                        model_window = running_audio_buffer[:model_window_size]
+                        running_audio_buffer = running_audio_buffer[model_window_size:]
+                        try:
+                            labels = model.predict_threshold([model_window], min_p=0.10)
+                            for label, prob in labels:
+                                species_counts[label] += 1
+                                known_birds.add(label)
+                        except Exception as e:
+                            errors.append(f"Audio processing error: {e}")
+                process_sensor_data(sensors, accum_sensor_sums, accum_sensor_counts, errors, motion_trips)
+                if "temp" in accum_sensor_sums and accum_sensor_counts["temp"] > 0:
+                    temperatures.append(accum_sensor_sums["temp"] / accum_sensor_counts["temp"])
                 time.sleep(1)
 
-            # ==== After period: summarize and build row ====
-            sens_avg = {k: (sensor_sums[k] / sensor_counts[k] if sensor_counts[k]>0 else None) for k in sensor_sums}
-            temp_c = sens_avg.get("temp", None)
+            # After cycle: sensor summaries
+            temp_c = accum_sensor_sums["temp"] / accum_sensor_counts["temp"] if accum_sensor_counts["temp"] > 0 else None
             temp_f = round(temp_c * 9 / 5 + 32, 2) if temp_c is not None else None
-            pressure = sens_avg.get("pressure", None)
+            temperature_running_avg = round(np.mean(temperatures), 2) if temperatures else None
+            pressure = accum_sensor_sums["pressure"] / accum_sensor_counts["pressure"] if accum_sensor_counts["pressure"] > 0 else None
             pressure_inhg = round(pressure * 0.02953, 2) if pressure is not None else None
-            humidity = sens_avg.get("humidity", None)
-            gas = sens_avg.get("gas", None)
-            light = int(sens_avg.get("light", 0) > 0) if "light" in sens_avg else 0
+            humidity = accum_sensor_sums["humidity"] / accum_sensor_counts["humidity"] if accum_sensor_counts["humidity"] > 0 else None
+            gas = accum_sensor_sums["gas"] / accum_sensor_counts["gas"] if accum_sensor_counts["gas"] > 0 else None
+            iaq = calculate_iaq(gas, humidity, temperature_running_avg)
+            light = int((accum_sensor_sums["light"] / accum_sensor_counts["light"]) > 0) if accum_sensor_counts["light"] > 0 else 0
+            gps = gps_startup_loc
+            bioacoustic_indices = analyze_audio_data(bio_chunks, stream.sr, errors)
 
-            bioacoustic_indices = analyze_audio_data(period_audio_chunks, stream.sr, errors)
-            # Bird results
-            row = {
-                "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                "Temperature (C)": round(temp_c,2) if temp_c is not None else None,
-                "Temperature (F)": temp_f,
-                "Pressure (hPa)": round(pressure,2) if pressure is not None else None,
-                "Pressure (inHg)": pressure_inhg,
-                "Humidity (%)": round(humidity,2) if humidity is not None else None,
-                "Gas": round(gas,2) if gas is not None else None,
-                "Light": light,
-                "Motion Trips": motion_trips[0],
-                "ADI": round(bioacoustic_indices.get("ADI",0),2),
-                "ACI": round(bioacoustic_indices.get("ACI",0),2),
-                "AEI": round(bioacoustic_indices.get("AEI",0),2),
-                "BI": round(bioacoustic_indices.get("BI",0),2),
-                "NDSI": round(bioacoustic_indices.get("NDSI",0),2),
-                "Total Species": sum(1 for v in bird_counts.values() if v>0),
-                "Total Detections": sum(bird_counts.values()),
-            }
-            # Add birds in consistent order
-            for bird in sorted(known_birds):
-                row[bird] = bird_counts[bird]
-                if bird not in header: header.append(bird)
+            # Dynamically build full header with all ever-seen birds
+            all_birds = sorted(known_birds)
+            header = static_header + all_birds
 
-            # Save this row in batch
+            # Build consistent row
+            row = OrderedDict()
+            row["timestamp"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            row["gps"] = gps
+            row["Temperature (C)"] = round(temp_c,2) if temp_c is not None else None
+            row["Temperature (F)"] = temp_f
+            row["Pressure (hPa)"] = round(pressure,2) if pressure is not None else None
+            row["Pressure (inHg)"] = pressure_inhg
+            row["Humidity (%)"] = round(humidity,2) if humidity is not None else None
+            row["Gas"] = round(gas,2) if gas is not None else None
+            row["IAQ"] = iaq
+            row["Light"] = light
+            row["Motion Trips"] = motion_trips[0]
+            row["ADI"] = round(bioacoustic_indices.get("ADI",0),2)
+            row["ACI"] = round(bioacoustic_indices.get("ACI",0),2)
+            row["AEI"] = round(bioacoustic_indices.get("AEI",0),2)
+            row["BI"] = round(bioacoustic_indices.get("BI",0),2)
+            row["NDSI"] = round(bioacoustic_indices.get("NDSI",0),2)
+            row["Total Species"] = len([k for k,v in species_counts.items() if v > 0])
+            row["Total Detections"] = sum(species_counts.values())
+            row["Temp Running Avg (C)"] = temperature_running_avg
+            for bird in all_birds:
+                row[bird] = species_counts.get(bird, 0)
+
+            print("\nCycle summary:", row)
             batch_rows.append(row)
-            print("Period summary:", row)
+            cycles_since_write += 1
 
-            # ========== after SAVE_AFTER_CYCLES, append DataFrame and save ========
-            if len(batch_rows) >= SAVE_AFTER_CYCLES:
+            # Write batch with consistent columns
+            if cycles_since_write >= CYCLES_PER_WRITE or (cycle_idx+1) == CYCLES_PER_SHUTDOWN:
+                # Fill missing bird columns for all batch rows
+                for r in batch_rows:
+                    for bird in all_birds:
+                        if bird not in r: r[bird] = 0
                 df = pd.DataFrame(batch_rows, columns=header)
-                safe_local_write(df, filename, header=True)
-                safe_usb_copy(filename, filename)
-                batch_rows.clear()
+                safe_local_append(df, filename, header=True)
+                safe_usb_append(df, filename, header=True)
+                batch_rows = []
+                cycles_since_write = 0
 
-            # Write one row as an extra local save for robustness
-            elif len(batch_rows) == 1:
-                df = pd.DataFrame([row], columns=header)
-                safe_local_write(df, filename, header=True)
-                # No USB write yet
-
-            # (Optional) reboot and copy on 24hr cycle
-            if time.time() - start_time > 24 * 60 * 60:
-                if batch_rows:
-                    df = pd.DataFrame(batch_rows, columns=header)
-                    safe_local_write(df, filename, header=True)
-                    safe_usb_copy(filename, filename)
-                print("Rebooting system after 24hr.")
-                subprocess.run(["sudo", "reboot"])
-
-            cycle_count += 1
+        print(f"\nCompleted {CYCLES_PER_SHUTDOWN} cycles. Shutting down Pi.")
+        subprocess.run(["sudo", "shutdown", "-h", "now"])
 
     except KeyboardInterrupt:
-        print("Interrupted by user.")
+        print("\nInterrupted by user.")
+    except Exception as exc:
+        print(f"\nERROR in main loop: {exc}")
     finally:
         stream.stop()
         print("Audio stream stopped.")
